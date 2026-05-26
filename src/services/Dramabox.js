@@ -1,5 +1,6 @@
 import axios from "axios";
 import NodeCache from "node-cache";
+import { SocksProxyAgent } from "socks-proxy-agent";
 import DramaboxUtil from "../utils/DramaboxUtil.js";
 import { config } from "../config/config.js";
 
@@ -66,45 +67,76 @@ const formatError = (error, context = "") => {
 
     switch (status) {
       case 400:
-        return `${prefix}Bad Request - Parameter tidak valid`;
+        return `${prefix}Bad Request - Invalid parameters`;
       case 401:
-        return `${prefix}Unauthorized - Token tidak valid atau expired`;
+        return `${prefix}Unauthorized - Token is invalid or expired`;
       case 403:
-        return `${prefix}Forbidden - Akses ditolak oleh server`;
+        return `${prefix}Forbidden - Access denied by server`;
       case 404:
-        return `${prefix}Not Found - Data tidak ditemukan`;
+        return `${prefix}Not Found - Data not found`;
       case 408:
-        return `${prefix}Request Timeout - Server tidak merespons`;
+        return `${prefix}Request Timeout - Server did not respond`;
       case 429:
-        return `${prefix}Too Many Requests - Rate limit tercapai, coba lagi nanti`;
+        return `${prefix}Too Many Requests - Rate limit reached, please try again later`;
       case 500:
-        return `${prefix}Internal Server Error - Server sedang bermasalah`;
+        return `${prefix}Internal Server Error - Server is experiencing issues`;
       case 502:
-        return `${prefix}Bad Gateway - Server upstream tidak merespons (coba lagi)`;
+        return `${prefix}Bad Gateway - Upstream server not responding (please retry)`;
       case 503:
-        return `${prefix}Service Unavailable - Server sedang maintenance`;
+        return `${prefix}Service Unavailable - Server is under maintenance`;
       case 504:
-        return `${prefix}Gateway Timeout - Koneksi ke server timeout`;
+        return `${prefix}Gateway Timeout - Connection to server timed out`;
       default:
         return `${prefix}HTTP ${status} ${statusText}`;
     }
   }
 
   if (error.code === "ECONNABORTED") {
-    return `${prefix}Request timeout - Koneksi terlalu lama`;
+    return `${prefix}Request timeout - Connection took too long`;
   }
   if (error.code === "ENOTFOUND") {
-    return `${prefix}DNS Error - Server tidak ditemukan`;
+    return `${prefix}DNS Error - Server not found`;
   }
   if (error.code === "ECONNREFUSED") {
-    return `${prefix}Connection Refused - Server menolak koneksi`;
+    return `${prefix}Connection Refused - Server rejected the connection`;
   }
   if (error.code === "ECONNRESET") {
-    return `${prefix}Connection Reset - Koneksi terputus`;
+    return `${prefix}Connection Reset - Connection was interrupted`;
   }
 
   return `${prefix}${error.message}`;
 };
+
+// ============================================
+// PROXY MANAGER
+// ============================================
+let currentProxyAgent = null;
+
+async function refreshProxy() {
+  const apiKey = process.env.PROXY_API_KEY;
+  if (!apiKey) {
+    console.log("[Proxy] PROXY_API_KEY not set — running without proxy.");
+    return;
+  }
+  try {
+    const res = await axios.get(
+      `https://exsalapi.my.id/api/network/socks5-pool?apikey=${apiKey}`,
+      { timeout: 10000 }
+    );
+    const proxies = (res.data?.data?.proxies || []).filter(
+      (p) => p.status === "standby" && p.is_ready
+    );
+    if (proxies.length === 0) {
+      console.log("[Proxy] No standby proxies available.");
+      return;
+    }
+    const pick = proxies[Math.floor(Math.random() * proxies.length)];
+    currentProxyAgent = new SocksProxyAgent(`socks5://${pick.address}`);
+    console.log(`[Proxy] ✅ Using ${pick.address} (${pick.location})`);
+  } catch (err) {
+    console.error("[Proxy] Failed to fetch proxy:", err.message);
+  }
+}
 
 // ============================================
 // DRAMABOX CLASS
@@ -122,6 +154,9 @@ export default class Dramabox {
     this.util = new DramaboxUtil();
     this.lang = lang;
     this.instanceId = Math.random().toString(36).substring(7);
+
+    // Fetch initial proxy on startup (non-blocking)
+    refreshProxy().catch(() => {});
 
     // Create axios instance with defaults
     this.http = axios.create({
@@ -324,6 +359,8 @@ export default class Dramabox {
         headers,
         timeout: CONFIG.REQUEST_TIMEOUT,
         data: method.toUpperCase() !== "GET" ? payload : undefined,
+        // Attach SOCKS5 proxy agent for Dramabox API requests only
+        ...((!isWebfic && currentProxyAgent) && { httpsAgent: currentProxyAgent }),
       };
 
       const response = await this.http.request(config);
@@ -352,10 +389,15 @@ export default class Dramabox {
           } in ${retryDelay}ms...`
         );
 
-        // If 502/503, also regenerate token
-        if (error.response?.status === 502 || error.response?.status === 503) {
+        // If blocked or bad gateway, rotate proxy before retrying
+        if (
+          error.response?.status === 403 ||
+          error.response?.status === 502 ||
+          error.response?.status === 503
+        ) {
           this.tokenCache = null;
           cache.del(`token_${this.lang}`);
+          await refreshProxy();
         }
 
         await delay(retryDelay);
@@ -394,7 +436,7 @@ export default class Dramabox {
 
   async getStreamUrl(bookId, episode) {
     if (!bookId || !episode) {
-      throw new Error("Parameter bookId dan episode wajib diisi.");
+      throw new Error("Parameters bookId and episode are required.");
     }
 
     const cacheKey = `stream_${bookId}_${episode}_${this.lang}`;
@@ -425,7 +467,7 @@ export default class Dramabox {
         const rawData = response.data;
 
         if (!rawData || !rawData.chapter) {
-          throw new Error("Episode tidak ditemukan atau terkunci.");
+          throw new Error("Episode not found or locked.");
         }
 
         const result = {
@@ -544,7 +586,7 @@ export default class Dramabox {
     let totalChapters = 0;
 
     console.log(`\n${"=".repeat(50)}`);
-    console.log(`🚀 Memulai scraping untuk Book ID: ${bookId}`);
+    console.log(`🚀 Starting batch download for Book ID: ${bookId}`);
     console.log(`${"=".repeat(50)}`);
 
     const fetchBatch = async (index, bId, isRetry = false) => {
@@ -576,20 +618,20 @@ export default class Dramabox {
           !isEndOfBook
         ) {
           console.log(
-            `⚠️ Data terbatas (${chapters.length}). Memicu Refresh Token...`
+            `⚠️ Limited data returned (${chapters.length} chapters). Triggering token refresh...`
           );
           throw new Error("TriggerRetry: Data suspected limited");
         }
 
         if (chapters.length === 0 && index !== savedPayChapterNum) {
-          throw new Error("Soft Error: Data kosong");
+          throw new Error("Soft Error: Empty response");
         }
 
         console.log(`✅ Success (${chapters.length} items)`);
         return data;
       } catch (error) {
         if (!isRetry) {
-          console.log(`\n🔄 [RETRY] Menyegarkan sesi untuk Index ${index}...`);
+          console.log(`\n🔄 [RETRY] Refreshing session for Index ${index}...`);
           this.tokenCache = null;
           cache.del(`token_${this.lang}`);
           await this.generateNewToken(Date.now());
@@ -613,7 +655,7 @@ export default class Dramabox {
         const bookName = firstBatchData.data.bookName;
         savedPayChapterNum = firstBatchData.data.payChapterNum || 0;
 
-        console.log(`📖 Judul: ${bookName} | Total Eps: ${totalChapters}`);
+        console.log(`📖 Title: ${bookName} | Total Episodes: ${totalChapters}`);
         if (firstBatchData.data.chapterList)
           result.push(...firstBatchData.data.chapterList);
 
@@ -669,12 +711,12 @@ export default class Dramabox {
         });
 
       console.log(`\n${"=".repeat(50)}`);
-      console.log(`✅ SELESAI. Output Bersih: ${finalResult.length} Episode`);
+      console.log(`✅ Done. Clean output: ${finalResult.length} episodes`);
       console.log(`${"=".repeat(50)}\n`);
 
       return finalResult;
     } catch (error) {
-      console.error("Critical Error dalam batchDownload:", error);
+      console.error("Critical error in batchDownload:", error);
       return [];
     }
   }
