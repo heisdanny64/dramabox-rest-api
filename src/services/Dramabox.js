@@ -29,7 +29,7 @@ const CONFIG = {
   TOKEN_TIMEOUT: 15000, // 15 seconds
 
   // Error codes to retry
-  RETRYABLE_STATUS_CODES: [408, 429, 500, 502, 503, 504],
+  RETRYABLE_STATUS_CODES: [403, 408, 429, 500, 502, 503, 504],
 };
 
 // ============================================
@@ -155,7 +155,7 @@ export default class Dramabox {
     this.lang = lang;
     this.instanceId = Math.random().toString(36).substring(7);
 
-    // Fetch initial proxy on startup (non-blocking)
+    // Kick off proxy fetch at startup — generateNewToken will await it if not ready yet
     refreshProxy().catch(() => {});
 
     // Create axios instance with defaults
@@ -239,12 +239,20 @@ export default class Dramabox {
 
       const url = `${this.baseUrl_Dramabox}/drama-box/ap001/bootstrap?timestamp=${timestamp}`;
 
+      // Ensure a proxy is ready before hitting Dramabox directly
+      if (!currentProxyAgent) {
+        console.log("[Token] No proxy loaded yet — fetching one first...");
+        await refreshProxy();
+      }
+
       const res = await axios.post(
         url,
         { distinctId: null },
         {
           headers,
           timeout: CONFIG.TOKEN_TIMEOUT,
+          // Route through SOCKS5 proxy so Render's IP is never seen by Dramabox
+          ...(currentProxyAgent && { httpsAgent: currentProxyAgent }),
         }
       );
 
@@ -275,11 +283,10 @@ export default class Dramabox {
       if (attempt < CONFIG.MAX_RETRIES && isRetryableError(error)) {
         const retryDelay = getRetryDelay(attempt);
         console.log(
-          `[Token] ⚠️ ${formatError(
-            error,
-            "Token"
-          )} - Retrying in ${retryDelay}ms...`
+          `[Token] ⚠️ ${formatError(error, "Token")} - Rotating proxy and retrying in ${retryDelay}ms...`
         );
+        // Rotate proxy on every token retry — the current one may be blocked too
+        await refreshProxy();
         await delay(retryDelay);
         return this.generateNewToken(Date.now(), attempt + 1);
       }
