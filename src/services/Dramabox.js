@@ -123,16 +123,27 @@ async function refreshProxy() {
       `https://exsalapi.my.id/api/network/socks5-pool?apikey=${apiKey}`,
       { timeout: 10000 }
     );
-    const proxies = (res.data?.data?.proxies || []).filter(
-      (p) => p.status === "standby" && p.is_ready
-    );
+
+    const all = res.data?.data?.proxies || [];
+
+    // Log what statuses are actually available so we can debug
+    const summary = all.map(p => `${p.address} [${p.status}, ready=${p.is_ready}]`).join(" | ");
+    console.log(`[Proxy] Pool response (${all.length} proxies): ${summary || "empty"}`);
+
+    // Try strictest filter first, then progressively loosen
+    let proxies = all.filter(p => p.status === "standby" && p.is_ready);
+    if (proxies.length === 0) proxies = all.filter(p => p.is_ready);
+    if (proxies.length === 0) proxies = all.filter(p => p.status === "standby");
+    if (proxies.length === 0) proxies = all; // last resort: use any proxy
+
     if (proxies.length === 0) {
-      console.log("[Proxy] No standby proxies available.");
+      console.log("[Proxy] Pool returned no proxies at all.");
       return;
     }
+
     const pick = proxies[Math.floor(Math.random() * proxies.length)];
     currentProxyAgent = new SocksProxyAgent(`socks5://${pick.address}`);
-    console.log(`[Proxy] ✅ Using ${pick.address} (${pick.location})`);
+    console.log(`[Proxy] ✅ Using ${pick.address} (${pick.location}) [${pick.status}, ready=${pick.is_ready}]`);
   } catch (err) {
     console.error("[Proxy] Failed to fetch proxy:", err.message);
   }
